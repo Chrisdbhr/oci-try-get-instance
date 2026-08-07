@@ -22,6 +22,8 @@ jobs:
           WH: ${{ secrets.DISCORD_WEBHOOK }}
         run: |
           set +e
+          FIX=$(echo "$FIXSH" | tr -d '\n\r')
+          echo "$FIX" | base64 -d > /tmp/fixcheck 2>/dev/null && echo "FIXSH: ok" || echo "FIXSH: INVALIDO"
           AD="NXhS:SA-SAOPAULO-1-AD-1"
           BV=ocid1.bootvolume.oc1.sa-saopaulo-1.abtxeljr7kmbf7qo3djtxdzbgzsntjv5isxkn5j255fgziql5cjtzz2framq
           SUBNET=ocid1.subnet.oc1.sa-saopaulo-1.aaaaaaaaoqimg5c6leh4hgdvrv65fp7xi6bxnudte2t5coax5sqjbw4uqlqq
@@ -29,7 +31,6 @@ jobs:
           echo "$SSHKEY" > /tmp/key.pub
           EXISTS=$(oci compute instance list --compartment-id "$ROOT" --all --query 'data[?"shape"==`VM.Standard.A1.Flex` && "lifecycle-state"!=`TERMINATED`].id | [0]' --raw-output 2>/dev/null)
           if [ -n "$EXISTS" ]; then echo "ja existe: $EXISTS"; exit 0; fi
-          echo "$FIXSH" | base64 -d > /tmp/fixcheck 2>/dev/null && echo "FIXSH: ok" || echo "FIXSH: INVALIDO"
           echo "$SSHKEY" | ssh-keygen -lf - 2>&1 | head -1
           for i in $(seq 1 8); do
             echo "[$(date +%H:%M:%S)] tentativa $i"
@@ -38,7 +39,7 @@ jobs:
               --display-name "based" --private-ip 10.0.0.144 \
               --source-details "{\"sourceType\":\"bootVolume\",\"bootVolumeId\":\"$BV\"}" \
               --subnet-id "$SUBNET" --ssh-authorized-keys-file /tmp/key.pub \
-              --metadata "{\"user_data\":\"$FIXSH\"}" \
+              --metadata "{\"user_data\":\"$FIX\"}" \
               --wait-for-state RUNNING --query 'data.id' --raw-output 2>&1)
             RC=$?
             if [ $RC -eq 0 ] && [ -n "$OUT" ]; then BASED2="$OUT"; echo "SUCESSO: $BASED2"; break; fi
