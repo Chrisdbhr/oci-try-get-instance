@@ -40,7 +40,7 @@ jobs:
               --wait-for-state RUNNING --query 'data.id' --raw-output 2>&1)
             RC=$?
             if [ $RC -eq 0 ] && [ -n "$OUT" ]; then BASED2="$OUT"; echo "SUCESSO: $BASED2"; break; fi
-            echo "falhou (rc=$RC): $(echo "$OUT" | tail -c 300)"
+            echo "falhou (rc=$RC): $(echo "$OUT" | grep -oE '\"(code|message)\": \"[^\"]*\"' | tr '\n' ' ')"
             sleep 90
           done
           if [ -z "$BASED2" ]; then echo "sem capacidade nesta rodada"; exit 0; fi
