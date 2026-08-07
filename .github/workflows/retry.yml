@@ -29,6 +29,8 @@ jobs:
           echo "$SSHKEY" > /tmp/key.pub
           EXISTS=$(oci compute instance list --compartment-id "$ROOT" --all --query 'data[?"shape"==`VM.Standard.A1.Flex` && "lifecycle-state"!=`TERMINATED`].id | [0]' --raw-output 2>/dev/null)
           if [ -n "$EXISTS" ]; then echo "ja existe: $EXISTS"; exit 0; fi
+          echo "$FIXSH" | base64 -d > /tmp/fixcheck 2>/dev/null && echo "FIXSH: ok" || echo "FIXSH: INVALIDO"
+          echo "$SSHKEY" | ssh-keygen -lf - 2>&1 | head -1
           for i in $(seq 1 8); do
             echo "[$(date +%H:%M:%S)] tentativa $i"
             OUT=$(oci compute instance launch --compartment-id "$ROOT" --availability-domain "$AD" \
