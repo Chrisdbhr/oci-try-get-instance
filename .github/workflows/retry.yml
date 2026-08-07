@@ -27,22 +27,23 @@ jobs:
           SUBNET=ocid1.subnet.oc1.sa-saopaulo-1.aaaaaaaaoqimg5c6leh4hgdvrv65fp7xi6bxnudte2t5coax5sqjbw4uqlqq
           HD=ocid1.volume.oc1.sa-saopaulo-1.abtxeljrcme56jil6sejy2fep3lkde6mx24gqbwy5sbvo4s6lhk63lf2ikaa
           echo "$SSHKEY" > /tmp/key.pub
-          EXISTS=$(oci compute instance list --compartment-id "$ROOT" --all --query 'data[?"shape"==`VM.Standard.A1.Flex` && "lifecycle-state"!=`TERMINATED`].id | [0]' --raw-output 2>&1)
+          EXISTS=$(oci compute instance list --compartment-id "$ROOT" --all --query 'data[?"shape"==`VM.Standard.A1.Flex` && "lifecycle-state"!=`TERMINATED`].id | [0]' --raw-output 2>/dev/null)
           if [ -n "$EXISTS" ]; then echo "ja existe: $EXISTS"; exit 0; fi
           for i in $(seq 1 8); do
             echo "[$(date +%H:%M:%S)] tentativa $i"
-            BASED2=$(oci compute instance launch --compartment-id "$ROOT" --availability-domain "$AD" \
+            OUT=$(oci compute instance launch --compartment-id "$ROOT" --availability-domain "$AD" \
               --shape VM.Standard.A1.Flex --shape-config '{"ocpus":2,"memoryInGBs":12}' \
               --display-name "based" --private-ip 10.0.0.144 \
               --source-details "{\"sourceType\":\"bootVolume\",\"bootVolumeId\":\"$BV\"}" \
               --subnet-id "$SUBNET" --ssh-authorized-keys-file /tmp/key.pub \
               --metadata "{\"user_data\":\"$FIXSH\"}" \
               --wait-for-state RUNNING --query 'data.id' --raw-output 2>&1)
-            if [ -n "$BASED2" ]; then break; fi
+            RC=$?
+            if [ $RC -eq 0 ] && [ -n "$OUT" ]; then BASED2="$OUT"; echo "SUCESSO: $BASED2"; break; fi
+            echo "falhou (rc=$RC): $(echo "$OUT" | tail -c 300)"
             sleep 90
           done
           if [ -z "$BASED2" ]; then echo "sem capacidade nesta rodada"; exit 0; fi
-          echo "SUCESSO: $BASED2"
           sleep 60
           VNIC=$(oci compute vnic-attachment list --compartment-id "$ROOT" --instance-id "$BASED2" --query 'data[0]."vnic-id"' --raw-output)
           PID=$(oci network private-ip list --vnic-id "$VNIC" --query 'data[0].id' --raw-output)
