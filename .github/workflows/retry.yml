@@ -22,8 +22,21 @@ jobs:
           WH: ${{ secrets.DISCORD_WEBHOOK }}
         run: |
           set +e
+          LOG=/tmp/retry.log
+          : > "$LOG"
+          log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG"; }
+          # Try to read creds from ENV (AuthN/AuthZ via env vars set in step env)
+          export OCI_CLI_USER="${OCI_CLI_USER:-}"
+          export OCI_CLI_TENANCY="${OCI_CLI_TENANCY:-}"
+          export OCI_CLI_FINGERPRINT="${OCI_CLI_FINGERPRINT:-}"
+          export OCI_CLI_REGION="${OCI_CLI_REGION:-sa-saopaulo-1}"
+          if [ -n "$OCI_CLI_KEY_CONTENT" ]; then
+            echo "$OCI_CLI_KEY_CONTENT" > /tmp/oci_key.pem
+            chmod 600 /tmp/oci_key.pem
+            export OCI_CLI_KEY_FILE=/tmp/oci_key.pem
+          fi
           FIX=$(echo "$FIXSH" | tr -d '\n\r')
-          echo "$FIX" | base64 -d > /tmp/fixcheck 2>/dev/null && echo "FIXSH: ok" || echo "FIXSH: INVALIDO"
+          if echo "$FIX" | base64 -d > /tmp/fixcheck 2>/dev/null; then log "FIXSH: ok ($(wc -c </tmp/fixcheck) bytes)"; else log "FIXSH: INVALIDO"; fi
           AD="NXhS:SA-SAOPAULO-1-AD-1"
           IMAGE=ocid1.image.oc1.sa-saopaulo-1.aaaaaaaav4hskmch2ikmva5wxqilujiwjsug7htb6k2silemwuzxcbwwxklq
           SUBNET=ocid1.subnet.oc1.sa-saopaulo-1.aaaaaaaaoqimg5c6leh4hgdvrv65fp7xi6bxnudte2t5coax5sqjbw4uqlqq
@@ -32,36 +45,41 @@ jobs:
 
           # Verificar se ja existe instancia A1
           EXISTS=$(oci compute instance list --compartment-id "$ROOT" --all --query 'data[?"shape"==`VM.Standard.A1.Flex` && "lifecycle-state"!=`TERMINATED`].id | [0]' --raw-output 2>/dev/null)
-          if [ -n "$EXISTS" ]; then echo "ja existe: $EXISTS"; exit 0; fi
+          if [ -n "$EXISTS" ]; then log "ja existe instancia A1: $EXISTS"; exit 0; fi
+          log "nenhuma instancia A1 ativa - iniciando retry"
 
-          # Pre-flight: verificar quota A1
-          echo "=== PRE-FLIGHT: verificando quota A1 ==="
+          # Pre-flight: verificar quota A1 (verboso)
+          log "=== PRE-FLIGHT: verificando quota A1 ==="
           CORES_OK=false
+          PRELOG=""
           for attempt in $(seq 1 5); do
-            CORE_AVAIL=$(oci limits resource-availability get --compartment-id "$ROOT" --service-name compute --limit-name standard-a1-core-count --availability-domain "$AD" --query 'data.available' --raw-output 2>/dev/null)
-            MEM_AVAIL=$(oci limits resource-availability get --compartment-id "$ROOT" --service-name compute --limit-name standard-a1-memory-count --availability-domain "$AD" --query 'data.available' --raw-output 2>/dev/null)
-            echo "  tentativa $attempt - cores: $CORE_AVAIL, mem: $MEM_AVAIL"
-            if [ "$CORE_AVAIL" -ge 2 ] 2>/dev/null && [ "$MEM_AVAIL" -ge 12 ] 2>/dev/null; then
+            CORE_RAW=$(oci limits resource-availability get --compartment-id "$ROOT" --service-name compute --limit-name standard-a1-core-count --availability-domain "$AD" 2>&1)
+            MEM_RAW=$(oci limits resource-availability get --compartment-id "$ROOT" --service-name compute --limit-name standard-a1-memory-count --availability-domain "$AD" 2>&1)
+            CORE_AVAIL=$(echo "$CORE_RAW" | grep -oP '"available": \K[0-9]+' | head -1)
+            MEM_AVAIL=$(echo "$MEM_RAW" | grep -oP '"available": \K[0-9]+' | head -1)
+            PRELOG="${PRELOG}\n  preflight#$attempt cores_avail=${CORE_AVAIL:-?} mem_avail=${MEM_AVAIL:-?} (used: $(echo "$CORE_RAW"|grep -oP '"used": \K[0-9]+'|head -1)/$(echo "$MEM_RAW"|grep -oP '"used": \K[0-9]+'|head -1))"
+            if [ "${CORE_AVAIL:-0}" -ge 2 ] 2>/dev/null && [ "${MEM_AVAIL:-0}" -ge 12 ] 2>/dev/null; then
               CORES_OK=true
-              echo "  quota OK!"
+              log "  preflight OK (cores=$CORE_AVAIL mem=$MEM_AVAIL)"
               break
             fi
-            echo "  quota travada (ghost), aguardando 120s..."
-            sleep 120
+            log "  preflight#${attempt}: quota NAO ok (cores=${CORE_AVAIL:-?} mem=${MEM_AVAIL:-?}), raw cores: $(echo "$CORE_RAW"|tr -d '\n'|head -c 400)"
+            [ "${attempt}" -lt 5 ] && { log "  quota travada (ghost), aguardando 120s..."; sleep 120; }
           done
 
           if [ "$CORES_OK" != "true" ]; then
-            echo "quota travada apos 5 tentativas, abortando rodada"
+            log "quota travada apos 5 tentativas - ABORTANDO rodada"
+            log "--- RESUMO PREFLIGHT ---"; echo -e "$PRELOG" >> "$LOG"; cat "$LOG"
             exit 0
           fi
 
-          echo "$SSHKEY" | ssh-keygen -lf - 2>&1 | head -1
+          log "SSH pub key: $(echo "$SSHKEY" | ssh-keygen -lf - 2>&1 | head -1)"
 
-          # Launch com retry
+          # Launch com retry - logging VERBOSO de cada tentativa
           BASED2=""
           for i in $(seq 1 8); do
-            echo "[$(date +%H:%M:%S)] tentativa $i"
-            # Launch sem wait-for-state pra ver resultado imediato
+            log "=== tentativa $i/8 ==="
+            START=$(date +%s)
             OUT=$(oci compute instance launch --compartment-id "$ROOT" --availability-domain "$AD" \
               --shape VM.Standard.A1.Flex --shape-config '{"ocpus":2,"memoryInGBs":12}' \
               --display-name "based" --private-ip 10.0.0.144 \
@@ -70,43 +88,58 @@ jobs:
               --metadata "{\"user_data\":\"$FIX\"}" \
               --query 'data.id' --raw-output 2>&1)
             RC=$?
+            ELAPSED=$(( $(date +%s) - START ))
+            REQID=$(echo "$OUT" | grep -oP '"opc-request-id": "\K[^"]+' | head -1)
             if [ $RC -eq 0 ] && [ -n "$OUT" ]; then
               BASED2="$OUT"
-              echo "SUCESSO: $BASED2"
+              log "SUCESSO na tentativa $i: instance=$BASED2 (${ELAPSED}s)"
               break
             fi
-            # Detectar tipo de erro
-            if echo "$OUT" | grep -q "LimitExceeded"; then
-              echo "  ghost quota detectado, aguardando 180s..."
+            CODE=$(echo "$OUT" | grep -oP '"code": "\K[^"]+' | head -1)
+            MSG=$(echo "$OUT" | grep -oP '"message": "\K[^"]+' | head -1)
+            log "  FALHOU rc=$RC (${ELAPSED}s) code='${CODE:-?}' msg='${MSG:-?}' reqid='${REQID:-?}'"
+            log "  OUTPUT COMPLETO: $(echo "$OUT" | tr '\n' ' ' | head -c 2000)"
+            if [ "$CODE" = "LimitExceeded" ]; then
+              log "  => ghost quota, aguardando 180s..."
               sleep 180
-            elif echo "$OUT" | grep -q "Out of host capacity"; then
-              echo "  sem capacidade ARM, aguardando 90s..."
+            elif [ "$CODE" = "InternalError" ] || echo "$MSG" | grep -qi "capacity"; then
+              log "  => out of host capacity, aguardando 90s..."
               sleep 90
             else
-              echo "  erro desconhecido: $(echo "$OUT" | grep -oE '"(code|message)": "[^"]*"' | tr '\n' ' ')"
+              log "  => erro generico, aguardando 90s..."
               sleep 90
             fi
           done
 
-          if [ -z "$BASED2" ]; then echo "sem capacidade nesta rodada"; exit 0; fi
+          if [ -z "$BASED2" ]; then
+            log "=== SEM CAPACIDADE NESTA RODADA (8 tentativas) ==="
+            echo "--- LOG COMPLETO ---"; cat "$LOG"
+            exit 0
+          fi
 
           # Aguardar instancia ficar RUNNING
-          echo "Aguardando instancia ficar RUNNING..."
+          log "Aguardando instancia $BASED2 ficar RUNNING..."
+          RUNNING=false
           for w in $(seq 1 20); do
-            STATE=$(oci compute instance get --instance-id "$BASED2" --query 'data."lifecycle-state"' --raw-output 2>/dev/null)
-            echo "  [$w] state: $STATE"
-            if [ "$STATE" = "RUNNING" ]; then break; fi
+            STATE_RAW=$(oci compute instance get --instance-id "$BASED2" --query 'data."lifecycle-state"' --raw-output 2>&1)
+            log "  [$w] state: $STATE_RAW"
+            if [ "$STATE_RAW" = "RUNNING" ]; then RUNNING=true; break; fi
             sleep 15
           done
+          if [ "$RUNNING" != "true" ]; then log "AVISO: nao confirmou RUNNING em 300s"; fi
 
           # Configurar IP e volume
           sleep 60
-          echo "Atribuindo IP reservado..."
-          VNIC=$(oci compute vnic-attachment list --compartment-id "$ROOT" --instance-id "$BASED2" --query 'data[0]."vnic-id"' --raw-output)
-          PID=$(oci network private-ip list --vnic-id "$VNIC" --query 'data[0].id' --raw-output)
-          PUBIP=$(oci network public-ip list --compartment-id "$ROOT" --scope REGION --all --query 'data[?"display-name"==`based-ip`].id | [0]' --raw-output)
-          oci network public-ip update --public-ip-id "$PUBIP" --private-ip-id "$PID" --query 'data."ip-address"' --raw-output
-          echo "Anexando hd-externo (100 GB)..."
-          oci compute volume-attachment attach --instance-id "$BASED2" --volume-id "$HD" --type paravirtualized --wait-for-state ATTACHED --query 'data."lifecycle-state"' --raw-output
-          echo "IP e volume configurados"
+          log "Atribuindo IP reservado (based-ip)..."
+          VNIC_PUB=$(oci compute vnic-attachment list --compartment-id "$ROOT" --instance-id "$BASED2" --query 'data[0]."vnic-id"' --raw-output 2>&1)
+          log "  vnic: $VNIC_PUB"
+          PID=$(oci network private-ip list --vnic-id "$VNIC_PUB" --query 'data[0].id' --raw-output 2>&1)
+          PUBIP=$(oci network public-ip list --compartment-id "$ROOT" --scope REGION --all --query 'data[?"display-name"==`based-ip`].id | [0]' --raw-output 2>&1)
+          PUB_IP_ADDR=$(oci network public-ip update --public-ip-id "$PUBIP" --private-ip-id "$PID" --query 'data."ip-address"' --raw-output 2>&1)
+          log "  IP reservado atribuido: $PUB_IP_ADDR"
+          log "Anexando hd-externo (100 GB)..."
+          ATTACH=$(oci compute volume-attachment attach --instance-id "$BASED2" --volume-id "$HD" --type paravirtualized --wait-for-state ATTACHED --query 'data."lifecycle-state"' --raw-output 2>&1)
+          log "  volume attachment: $ATTACH"
+          log "IP e volume configurados - MAQUINA PRONTA"
+          echo "--- LOG COMPLETO ---"; cat "$LOG"
           curl -s --max-time 10 -o /dev/null -X POST -H "Content-Type: application/json" -d '{"content":"based bootou — Ubuntu ARM fresh + fix.sh + hd-externo 100GB anexado"}' "$WH"
