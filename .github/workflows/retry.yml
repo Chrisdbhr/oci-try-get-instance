@@ -29,24 +29,77 @@ jobs:
           SUBNET=ocid1.subnet.oc1.sa-saopaulo-1.aaaaaaaaoqimg5c6leh4hgdvrv65fp7xi6bxnudte2t5coax5sqjbw4uqlqq
           HD=ocid1.volume.oc1.sa-saopaulo-1.abtxeljrogyuzulcob7br75h7njpavrwwkrgvf53uzebjnuss7cxdy6deiea
           echo "$SSHKEY" > /tmp/key.pub
+
+          # Verificar se ja existe instancia A1
           EXISTS=$(oci compute instance list --compartment-id "$ROOT" --all --query 'data[?"shape"==`VM.Standard.A1.Flex` && "lifecycle-state"!=`TERMINATED`].id | [0]' --raw-output 2>/dev/null)
           if [ -n "$EXISTS" ]; then echo "ja existe: $EXISTS"; exit 0; fi
+
+          # Pre-flight: verificar quota A1
+          echo "=== PRE-FLIGHT: verificando quota A1 ==="
+          CORES_OK=false
+          for attempt in $(seq 1 5); do
+            CORE_AVAIL=$(oci limits resource-availability get --compartment-id "$ROOT" --service-name compute --limit-name standard-a1-core-count --availability-domain "$AD" --query 'data.available' --raw-output 2>/dev/null)
+            MEM_AVAIL=$(oci limits resource-availability get --compartment-id "$ROOT" --service-name compute --limit-name standard-a1-memory-count --availability-domain "$AD" --query 'data.available' --raw-output 2>/dev/null)
+            echo "  tentativa $attempt - cores: $CORE_AVAIL, mem: $MEM_AVAIL"
+            if [ "$CORE_AVAIL" -ge 2 ] 2>/dev/null && [ "$MEM_AVAIL" -ge 12 ] 2>/dev/null; then
+              CORES_OK=true
+              echo "  quota OK!"
+              break
+            fi
+            echo "  quota travada (ghost), aguardando 120s..."
+            sleep 120
+          done
+
+          if [ "$CORES_OK" != "true" ]; then
+            echo "quota travada apos 5 tentativas, abortando rodada"
+            exit 0
+          fi
+
           echo "$SSHKEY" | ssh-keygen -lf - 2>&1 | head -1
+
+          # Launch com retry
+          BASED2=""
           for i in $(seq 1 8); do
             echo "[$(date +%H:%M:%S)] tentativa $i"
+            # Launch sem wait-for-state pra ver resultado imediato
             OUT=$(oci compute instance launch --compartment-id "$ROOT" --availability-domain "$AD" \
               --shape VM.Standard.A1.Flex --shape-config '{"ocpus":2,"memoryInGBs":12}' \
               --display-name "based" --private-ip 10.0.0.144 \
               --source-details "{\"sourceType\":\"image\",\"imageId\":\"$IMAGE\"}" \
               --subnet-id "$SUBNET" --ssh-authorized-keys-file /tmp/key.pub \
               --metadata "{\"user_data\":\"$FIX\"}" \
-              --wait-for-state RUNNING --query 'data.id' --raw-output 2>&1)
+              --query 'data.id' --raw-output 2>&1)
             RC=$?
-            if [ $RC -eq 0 ] && [ -n "$OUT" ]; then BASED2="$OUT"; echo "SUCESSO: $BASED2"; break; fi
-            echo "falhou (rc=$RC): $(echo "$OUT" | grep -oE '\"(code|message)\": \"[^\"]*\"' | tr '\n' ' ')"
-            sleep 90
+            if [ $RC -eq 0 ] && [ -n "$OUT" ]; then
+              BASED2="$OUT"
+              echo "SUCESSO: $BASED2"
+              break
+            fi
+            # Detectar tipo de erro
+            if echo "$OUT" | grep -q "LimitExceeded"; then
+              echo "  ghost quota detectado, aguardando 180s..."
+              sleep 180
+            elif echo "$OUT" | grep -q "Out of host capacity"; then
+              echo "  sem capacidade ARM, aguardando 90s..."
+              sleep 90
+            else
+              echo "  erro desconhecido: $(echo "$OUT" | grep -oE '"(code|message)": "[^"]*"' | tr '\n' ' ')"
+              sleep 90
+            fi
           done
+
           if [ -z "$BASED2" ]; then echo "sem capacidade nesta rodada"; exit 0; fi
+
+          # Aguardar instancia ficar RUNNING
+          echo "Aguardando instancia ficar RUNNING..."
+          for w in $(seq 1 20); do
+            STATE=$(oci compute instance get --instance-id "$BASED2" --query 'data."lifecycle-state"' --raw-output 2>/dev/null)
+            echo "  [$w] state: $STATE"
+            if [ "$STATE" = "RUNNING" ]; then break; fi
+            sleep 15
+          done
+
+          # Configurar IP e volume
           sleep 60
           echo "Atribuindo IP reservado..."
           VNIC=$(oci compute vnic-attachment list --compartment-id "$ROOT" --instance-id "$BASED2" --query 'data[0]."vnic-id"' --raw-output)
