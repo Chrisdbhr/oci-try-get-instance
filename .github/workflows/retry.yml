@@ -128,18 +128,20 @@ jobs:
           done
           if [ "$RUNNING" != "true" ]; then log "AVISO: nao confirmou RUNNING em 300s"; fi
 
-          # Configurar IP e volume
+          # NOTA: nao anexar o IP reservado 'based-ip' (129.148.26.109) pois ele
+          # agora pertence a MAQUINA MICRO (que deve continuar com esse IP fixo).
+          # A based usa um IP publico EPHEMERAL (padrao do VCN). Se um dia
+          # quisermos IP fixo para a based, criar OUTRO IP reservado novo.
           sleep 60
-          log "Atribuindo IP reservado (based-ip)..."
+          log "NOTA: based com IP efemero (129.148.26.109 fica na micro)."
+          log "Obtendo IP publico efemero da based..."
           VNIC_PUB=$(oci compute vnic-attachment list --compartment-id "$ROOT" --instance-id "$BASED2" --query 'data[0]."vnic-id"' --raw-output 2>&1)
           log "  vnic: $VNIC_PUB"
-          PID=$(oci network private-ip list --vnic-id "$VNIC_PUB" --query 'data[0].id' --raw-output 2>&1)
-          PUBIP=$(oci network public-ip list --compartment-id "$ROOT" --scope REGION --all --query 'data[?"display-name"==`based-ip`].id | [0]' --raw-output 2>&1)
-          PUB_IP_ADDR=$(oci network public-ip update --public-ip-id "$PUBIP" --private-ip-id "$PID" --query 'data."ip-address"' --raw-output 2>&1)
-          log "  IP reservado atribuido: $PUB_IP_ADDR"
+          PUB_IP=$(oci network private-ip list --vnic-id "$VNIC_PUB" --query 'data[0]."public-ip"' --raw-output 2>&1)
+          log "  IP publico efemero da based: ${PUB_IP:-N/D}"
           log "Anexando hd-externo (100 GB)..."
           ATTACH=$(oci compute volume-attachment attach --instance-id "$BASED2" --volume-id "$HD" --type paravirtualized --wait-for-state ATTACHED --query 'data."lifecycle-state"' --raw-output 2>&1)
           log "  volume attachment: $ATTACH"
           log "IP e volume configurados - MAQUINA PRONTA"
           echo "--- LOG COMPLETO ---"; cat "$LOG"
-          curl -s --max-time 10 -o /dev/null -X POST -H "Content-Type: application/json" -d '{"content":"based bootou — Ubuntu ARM fresh + fix.sh + hd-externo 100GB anexado"}' "$WH"
+          curl -s --max-time 10 -o /dev/null -X POST -H "Content-Type: application/json" -d '{"content":"based bootou — Ubuntu ARM fresh + fix.sh + hd-externo 100GB anexado (IP efemero)"}' "$WH"
