@@ -4,9 +4,14 @@ on:
     - cron: "*/10 * * * *"
   workflow_dispatch: {}
 
+concurrency:
+  group: retry-based
+  cancel-in-progress: false
+
 jobs:
   retry:
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     steps:
       - run: pip install -q oci-cli
       - name: retry
@@ -36,7 +41,13 @@ jobs:
             export OCI_CLI_KEY_FILE=/tmp/oci_key.pem
           fi
           FIX=$(echo "$FIXSH" | tr -d '\n\r')
-          if echo "$FIX" | base64 -d > /tmp/fixcheck 2>/dev/null; then log "FIXSH: ok ($(wc -c </tmp/fixcheck) bytes)"; else log "FIXSH: INVALIDO"; fi
+          if echo "$FIX" | base64 -d > /tmp/fixcheck 2>/dev/null && [ -s /tmp/fixcheck ]; then
+            log "FIXSH: ok ($(wc -c </tmp/fixcheck) bytes)"
+          else
+            log "FIXSH: INVALIDO (base64 quebrado ou vazio) - ABORTANDO para nao subir instancia sem fix.sh"
+            curl -s --max-time 10 -o /dev/null -X POST -H "Content-Type: application/json" -d '{"content":"⚠️ retry-based: FIXSH invalido — rodada abortada para nao criar instancia sem fix.sh"}' "$WH"
+            exit 1
+          fi
           AD="NXhS:SA-SAOPAULO-1-AD-1"
           IMAGE=ocid1.image.oc1.sa-saopaulo-1.aaaaaaaav4hskmch2ikmva5wxqilujiwjsug7htb6k2silemwuzxcbwwxklq
           SUBNET=ocid1.subnet.oc1.sa-saopaulo-1.aaaaaaaaoqimg5c6leh4hgdvrv65fp7xi6bxnudte2t5coax5sqjbw4uqlqq
@@ -48,35 +59,44 @@ jobs:
           if [ -n "$EXISTS" ]; then log "ja existe instancia A1: $EXISTS"; exit 0; fi
           log "nenhuma instancia A1 ativa - iniciando retry"
 
-          # Pre-flight: verificar quota A1 (verboso)
-          log "=== PRE-FLIGHT: verificando quota A1 ==="
-          CORES_OK=false
+          # Pre-flight: verificar quota A1 (INFORMATIVO). Nao aborta a rodada:
+          # capacidade de quota da API != capacidade real de host — as vezes o
+          # launch passa mesmo com o preflight "vermelho". Seguimos pro launch
+          # e deixamos o backoff dos erros de capacidade decidir.
+          log "=== PRE-FLIGHT: verificando quota A1 (informativo) ==="
+          CORES_AVAIL="?"
+          MEM_AVAIL="?"
+          GHOST=false
           PRELOG=""
-          for attempt in $(seq 1 5); do
+          for attempt in $(seq 1 3); do
             CORE_RAW=$(oci limits resource-availability get --compartment-id "$ROOT" --service-name compute --limit-name standard-a1-core-count --availability-domain "$AD" 2>&1)
             MEM_RAW=$(oci limits resource-availability get --compartment-id "$ROOT" --service-name compute --limit-name standard-a1-memory-count --availability-domain "$AD" 2>&1)
-            CORE_AVAIL=$(echo "$CORE_RAW" | grep -oP '"available": \K[0-9]+' | head -1)
+            CORES_AVAIL=$(echo "$CORE_RAW" | grep -oP '"available": \K[0-9]+' | head -1)
             MEM_AVAIL=$(echo "$MEM_RAW" | grep -oP '"available": \K[0-9]+' | head -1)
-            PRELOG="${PRELOG}\n  preflight#$attempt cores_avail=${CORE_AVAIL:-?} mem_avail=${MEM_AVAIL:-?} (used: $(echo "$CORE_RAW"|grep -oP '"used": \K[0-9]+'|head -1)/$(echo "$MEM_RAW"|grep -oP '"used": \K[0-9]+'|head -1))"
-            if [ "${CORE_AVAIL:-0}" -ge 2 ] 2>/dev/null && [ "${MEM_AVAIL:-0}" -ge 12 ] 2>/dev/null; then
-              CORES_OK=true
-              log "  preflight OK (cores=$CORE_AVAIL mem=$MEM_AVAIL)"
+            PRELOG="${PRELOG}\n  preflight#$attempt cores_avail=${CORES_AVAIL:-?} mem_avail=${MEM_AVAIL:-?} (used: $(echo "$CORE_RAW"|grep -oP '"used": \K[0-9]+'|head -1)/$(echo "$MEM_RAW"|grep -oP '"used": \K[0-9]+'|head -1))"
+            log "  preflight#$attempt cores_avail=${CORES_AVAIL:-?} mem_avail=${MEM_AVAIL:-?}"
+            if [ "${CORES_AVAIL:-0}" -ge 2 ] 2>/dev/null && [ "${MEM_AVAIL:-0}" -ge 12 ] 2>/dev/null; then
+              log "  => quota OK (cores=$CORES_AVAIL mem=$MEM_AVAIL) — prosseguindo ao launch"
               break
             fi
-            log "  preflight#${attempt}: quota NAO ok (cores=${CORE_AVAIL:-?} mem=${MEM_AVAIL:-?}), raw cores: $(echo "$CORE_RAW"|tr -d '\n'|head -c 400)"
-            [ "${attempt}" -lt 5 ] && { log "  quota travada (ghost), aguardando 120s..."; sleep 120; }
+            log "  -> quota NAO ok (cores=${CORES_AVAIL:-?} mem=${MEM_AVAIL:-?}) — seguindo ao launch mesmo assim"
+            GHOST=true
           done
-
-          if [ "$CORES_OK" != "true" ]; then
-            log "quota travada apos 5 tentativas - ABORTANDO rodada"
-            log "--- RESUMO PREFLIGHT ---"; echo -e "$PRELOG" >> "$LOG"; cat "$LOG"
-            exit 0
+          if [ "$GHOST" = "true" ]; then
+            log "NOTA: preflight viu quota travada (ghost) — avisando no Discord (nao aborta)"
+            echo -e "$PRELOG" >> "$LOG"
+            curl -s --max-time 10 -o /dev/null -X POST -H "Content-Type: application/json" -d '{"content":"⚠️ retry-based: preflight viu ghost quota (cores='${CORES_AVAIL:-?}' mem='${MEM_AVAIL:-?}') — seguindo ao launch mesmo assim"}' "$WH" || true
           fi
 
           log "SSH pub key: $(echo "$SSHKEY" | ssh-keygen -lf - 2>&1 | head -1)"
 
           # Launch com retry - logging VERBOSO de cada tentativa
+          # --no-retry: o SDK Python do OCI tem retry interno silencioso que pode
+          # loopar 429 Too Many Requests por minutos dentro de UM unico launch,
+          # o que desfaz o controle do nosso sleep. Fazemos o retry nos mesmos.
+          # --connection-timeout/--read-timeout: evita chamada presa indefinidamente.
           BASED2=""
+          TMR_BACKOFF=90
           for i in $(seq 1 8); do
             log "=== tentativa $i/8 ==="
             START=$(date +%s)
@@ -85,7 +105,8 @@ jobs:
               --display-name "based" --private-ip 10.0.0.144 \
               --source-details "{\"sourceType\":\"image\",\"imageId\":\"$IMAGE\"}" \
               --subnet-id "$SUBNET" --ssh-authorized-keys-file /tmp/key.pub \
-              --metadata "{\"user_data\":\"$FIX\"}" \
+              --metadata "{\"user_data\":\"$FIX\",\"IsPvEncryptionInTransitEnabled\":\"true\"}" \
+              --connection-timeout 60 --read-timeout 120 --no-retry \
               --query 'data.id' --raw-output 2>&1)
             RC=$?
             ELAPSED=$(( $(date +%s) - START ))
@@ -99,19 +120,43 @@ jobs:
             MSG=$(echo "$OUT" | grep -oP '"message": "\K[^"]+' | head -1)
             log "  FALHOU rc=$RC (${ELAPSED}s) code='${CODE:-?}' msg='${MSG:-?}' reqid='${REQID:-?}'"
             log "  OUTPUT COMPLETO: $(echo "$OUT" | tr '\n' ' ' | head -c 2000)"
-            if [ "$CODE" = "LimitExceeded" ]; then
-              log "  => ghost quota, aguardando 180s..."
-              sleep 180
-            elif [ "$CODE" = "InternalError" ] || echo "$MSG" | grep -qi "capacity"; then
-              log "  => out of host capacity, aguardando 90s..."
-              sleep 90
-            else
-              log "  => erro generico, aguardando 90s..."
-              sleep 90
-            fi
+            case "$CODE" in
+              NotAuthorizedOrNotFound)
+                log "  => erro FATAL (auth/OCID errado ou sem permissao) - parando rodada"
+                curl -s --max-time 10 -o /dev/null -X POST -H "Content-Type: application/json" -d '{"content":"⚠️ retry-based: erro FATAL NotAuthorizedOrNotFound — provavelmente OCID/credencial errada. Rodada parada."}' "$WH" || true
+                break
+                ;;
+              LimitExceeded)
+                log "  => ghost quota, aguardando 180s..."
+                sleep 180
+                ;;
+              TooManyRequests)
+                log "  => TooManyRequests, backoff progressivo ${TMR_BACKOFF}s..."
+                sleep "$TMR_BACKOFF"
+                [ "$TMR_BACKOFF" -lt 300 ] && TMR_BACKOFF=$((TMR_BACKOFF + 60))
+                ;;
+              InternalError|OutOfHostCapacity|IncorrectState)
+                log "  => out of host capacity, aguardando 90s..."
+                sleep 90
+                ;;
+              *)
+                if echo "$MSG" | grep -qi "capacity"; then
+                  log "  => capacity, aguardando 90s..."
+                  sleep 90
+                else
+                  log "  => erro generico, aguardando 90s..."
+                  sleep 90
+                fi
+                ;;
+            esac
           done
 
           if [ -z "$BASED2" ]; then
+            if [ "$CODE" = "NotAuthorizedOrNotFound" ]; then
+              log "=== RODADA PARADA POR ERRO FATAL (Nao tentou 8x) ==="
+              echo "--- LOG COMPLETO ---"; cat "$LOG"
+              exit 1
+            fi
             log "=== SEM CAPACIDADE NESTA RODADA (8 tentativas) ==="
             echo "--- LOG COMPLETO ---"; cat "$LOG"
             exit 0
@@ -142,6 +187,12 @@ jobs:
           log "Anexando hd-externo (100 GB)..."
           ATTACH=$(oci compute volume-attachment attach --instance-id "$BASED2" --volume-id "$HD" --type paravirtualized --wait-for-state ATTACHED --query 'data."lifecycle-state"' --raw-output 2>&1)
           log "  volume attachment: $ATTACH"
+          if [ "$ATTACH" != "ATTACHED" ]; then
+            log "ERRO: volume nao ficou ATTACHED - nao postando sucesso no Discord"
+            echo "--- LOG COMPLETO ---"; cat "$LOG"
+            curl -s --max-time 10 -o /dev/null -X POST -H "Content-Type: application/json" -d '{"content":"⚠️ retry-based: instancia based CRIADA mas volume hd-externo NAO anexou (ATTACH='$ATTACH'). Requer acao manual."}' "$WH" || true
+            exit 1
+          fi
           log "IP e volume configurados - MAQUINA PRONTA"
           echo "--- LOG COMPLETO ---"; cat "$LOG"
           curl -s --max-time 10 -o /dev/null -X POST -H "Content-Type: application/json" -d '{"content":"based bootou — Ubuntu ARM fresh + fix.sh + hd-externo 100GB anexado (IP efemero)"}' "$WH"
