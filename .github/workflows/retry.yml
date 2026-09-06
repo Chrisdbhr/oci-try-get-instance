@@ -134,16 +134,16 @@ jobs:
                 [ "$TMR_BACKOFF" -lt 300 ] && TMR_BACKOFF=$((TMR_BACKOFF + 60))
                 ;;
               InternalError|OutOfHostCapacity|IncorrectState)
-                log "  => out of host capacity, aguardando 90s..."
-                sleep 90
+                log "  => out of host capacity, aguardando 60s..."
+                sleep 60
                 ;;
               *)
                 if echo "$MSG" | grep -qi "capacity"; then
-                  log "  => capacity, aguardando 90s..."
-                  sleep 90
+                  log "  => capacity, aguardando 60s..."
+                  sleep 60
                 else
-                  log "  => erro generico, aguardando 90s..."
-                  sleep 90
+                  log "  => erro generico, aguardando 60s..."
+                  sleep 60
                 fi
                 ;;
             esac
