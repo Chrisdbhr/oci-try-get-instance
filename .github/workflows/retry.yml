@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
-      - run: pip install -q oci-cli
+      - run: pip install -q "oci-cli==3.94.*"
       - name: retry
         env:
           OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
@@ -103,7 +103,8 @@ jobs:
               --display-name "based" --private-ip 10.0.0.144 \
               --source-details "{\"sourceType\":\"image\",\"imageId\":\"$IMAGE\"}" \
               --subnet-id "$SUBNET" --ssh-authorized-keys-file /tmp/key.pub \
-              --metadata "{\"user_data\":\"$FIX\",\"IsPvEncryptionInTransitEnabled\":\"true\"}" \
+              --metadata "{\"user_data\":\"$FIX\"}" \
+              --is-pv-encryption-in-transit-enabled true \
               --connection-timeout 60 --read-timeout 120 --no-retry \
               --query 'data.id' --raw-output 2>&1)
             RC=$?
